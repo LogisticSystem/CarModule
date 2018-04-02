@@ -1,136 +1,301 @@
-﻿//using Newtonsoft.Json;
-//using RabbitMQ.Client;
-//using RabbitMQ.Client.Events;
-//using System;
-//using System.Collections.Generic;
-//using System.IO;
-//using System.Linq;
-//using System.Net;
-//using System.Net.Http;
-//using System.Runtime.Serialization;
-//using System.Runtime.Serialization.Json;
-//using System.Text;
+﻿using Newtonsoft.Json;
+using RabbitMQ.Client;
+using System;
+using System.Collections.Generic;
+using System.IO;
+using System.Linq;
+using System.Net;
+using System.Text;
+using System.Threading;
 
-//namespace CarModule
-//{
-//    [DataContract]
-//    class Car
-//    {
-//        [DataMember]
-//        public String Id { get; private set; } //The car's Id, which can help identify the car from others.
-//        [DataMember]
-//        public Int32 Capacity { get; private set; }//How much items the car can take.
-//        [DataMember]
-//        public List<Item> Items { get; set; }//Items in the car.
-//        public Int32 Speed { get; private set; }//The car's speed.
-//        [DataMember]
-//        public String PointTo { get; set; }//Point, in which the car goes
-//        [DataMember]
-//        public String PointFrom { get; set; }//Point, from which car goes.
-//        [DataMember]
-//        public Int32 RoadPercent { get; set; }//Percentage of travel.
-//        private JsonSerializerSettings _jsonSerializerSettings = 
-//            new JsonSerializerSettings
-//            {
-//                ContractResolver = new Newtonsoft.Json.Serialization.CamelCasePropertyNamesContractResolver()
-//            };
-//        //Connection to RabbitMQ
-//        private ConnectionFactory factory = new ConnectionFactory
-//        {
-//            UserName = "user",
-//            Password = "password",
-//            HostName = "10.99.166.197",
-//            Port = 5672
-//        };
-//        Logger logger { get; set; }
+namespace CarModule
+{
+    class Car
+    {
+        public const Int32 default_speed = 1;
+        public String transportId { get; private set; } //The car's Id, which can help identify the car from others.
+        public Int32 Capacity { get; set; }//How much items the car can take.
+        public List<Product> Products { get; set; }//products in the car.
+        public Int32 RoadLength { get; set; }//The car's speed, which depends on road length.
+        public String PointTo { get; set; }//Point, in which the car goes
+        public String PointFrom { get; set; }//Point, from which car goes.
+        public String NextPoint { get; set; }//Next point in Route
+        public Int32 RoadPercent { get; set; }//Percentage of travel.
+        //Setting for lowercase
+        public static JsonSerializerSettings _jsonSerializerSettings =
+            new JsonSerializerSettings
+            {
+                ContractResolver = new Newtonsoft.Json.Serialization.CamelCasePropertyNamesContractResolver()
+            };
+        //logger
+        [JsonIgnoreAttribute]
+        public Logger logger;
+        [JsonIgnoreAttribute]
+        public IModel channel;
 
-//        public Car(String id, Int32 capacity)
-//        {
-//            Id = id;
-//            Capacity = capacity;
-//            Items = new List<Item>();
-//            Speed = 100;
-//            RoadPercent = 0;
-//            logger = new Logger(id); 
-//        }
+        public Car(String id, Int32 capacity, IConnection connection)
+        {
+            transportId = id;
+            Capacity = capacity;
+            Products = new List<Product>();
+            RoadLength = 5;
+            RoadPercent = 0;
+            logger = new Logger(id);
+            this.channel = connection.CreateModel();
+        }
+        #region Communication with StorageService
+        /// <summary>
+        /// Параметры запроса на забор товаров у склада: "capacity": int (nullable),"accessiblePoints": [str] (nullable)
+        /// </summary>
+        public static void GetProductsFromStorage(Car car)
+        {
+            var requestString = @"http://188.225.9.3/storages/" + car.PointFrom + "/products/prepare";
+            var json = "{\"capacity\": " + car.Capacity + "}";
+            Console.WriteLine(String.Format("{0} is waiting for products from STORAGE {1}", car.transportId, car.PointFrom));
+            car.logger.Log(String.Format("{0} is waiting for products from STORAGE {1}", car.transportId, car.PointFrom));
+            Thread.Sleep(3000);
 
-//        //
-//        public void AskWarehouseForItemsAsync(Car car, String warehouseId)
-//        {
+            string productsJson = "";
 
-//        }
-    
+            string responseJson = "";
+            while (!car.Products.Any())
+            {
+                var httpWebRequest = (HttpWebRequest)WebRequest.Create(requestString);
+                httpWebRequest.ContentType = "application/json";
+                httpWebRequest.Method = "POST";
+                httpWebRequest.Accept = "*/*";
+                var body = Encoding.UTF8.GetBytes(json);
 
-//        public void SayPointAboutUnloadingItems()
-//        {
-//            var items = JsonConvert.SerializeObject(Items, _jsonSerializerSettings);
-//            var body = Encoding.UTF8.GetBytes(items);
-//            var request = (HttpWebRequest)WebRequest.Create("http://url");
+                using (Stream stream = httpWebRequest.GetRequestStream())
+                {
+                    stream.Write(body, 0, body.Length);
+                    stream.Close();
+                }
+                try
+                {
+                    var httpResponse = (HttpWebResponse)httpWebRequest.GetResponse();
+                    using (var streamReader = new StreamReader(httpResponse.GetResponseStream()))
+                    {
+                        responseJson = streamReader.ReadToEnd();
+                    }
+                    productsJson = responseJson.Substring(12, responseJson.Length - 13);
+                    car.Products = JsonConvert.DeserializeObject<List<Product>>(productsJson);
+                }
+                catch (Exception e)
+                {
+                    Console.WriteLine(e);
+                    car.logger.Log(e.ToString());
+                }
+            }
 
-//            request.Method = "GET";
-//            request.ContentType = "application/json";
-//            request.ContentLength = body.Length;
+            car.PointTo = car.Products[0].Destination; //Точка назначения сооттветсвует конечной точке товаров
+            string getItemsJson = "{\"action\": \"getItems\", \"transportId\":\"" + car.transportId + "\", " + "\"storageId\":\"" + car.PointFrom + "\", " + "\"capacity\":" + car.Capacity + "}";
+            car.SendToRabbitMQ(getItemsJson, car.channel);
+            //Форматируем для логера
+            string productsStr = String.Join(", \n", car.Products);
+            string log = String.Format("{0} GET from STORAGE \"{1}\" PRODUCTS:\n{2}", car.transportId, car.PointFrom, productsStr);
+            Console.WriteLine(log);
+            car.logger.Log(log);
 
-//            using (Stream stream = request.GetRequestStream())
-//            {
-//                stream.Write(body, 0, body.Length);
-//                stream.Close();
-//            }
+        }
+        public static void PutProductsToStorage(Car car)
+        {
+            var requestString = @"http://188.225.9.3/storages/" + car.PointTo + "/products";
 
-//            using (HttpWebResponse response = (HttpWebResponse)request.GetResponse())
-//            {
-//                response.Close();
-//            }
-//        }
-//        public void SayProductAboutUnloadingItems()
-//        {
-//            var items = new MessageToProducts(Items, PointTo, Id);//Create class for serialization
-//            String unloadItemsMessage = JsonConvert.SerializeObject(items, _jsonSerializerSettings);
+            var productsJson = JsonConvert.SerializeObject(car.Products, _jsonSerializerSettings);
+            string json = "{\"products\": " + productsJson + ", \"transportId\": \"" + car.transportId + "\"}";
+            string httpResult = "";
+            string productsStr = "";
+            while (httpResult != "OK")
+            {
+                var httpWebRequest = (HttpWebRequest)WebRequest.Create(requestString);
+                httpWebRequest.ContentType = "application/json";
+                httpWebRequest.Method = "POST";
+                httpWebRequest.Accept = "*/*";
+                var body = Encoding.UTF8.GetBytes(json);
+                using (Stream stream = httpWebRequest.GetRequestStream())
+                {
+                    stream.Write(body, 0, body.Length);
+                }
+                try
+                {
+                    using (var httpResponse = (HttpWebResponse)httpWebRequest.GetResponse())
+                    {
+                        httpResult = httpResponse.StatusCode.ToString();
+                    }
+                    if (httpResult == "OK")
+                    {
+                        car.PointFrom = car.PointTo;
+                    }
+                    productsStr = String.Join(", \n", car.Products);
+                    car.Products.Clear();
+                }
+                catch (Exception e)
+                {
+                    Console.WriteLine(e);
+                }
+            }
+            string gaveItemsJson = "{\"action\": \"gaveItems\", \"transportId\":\"" + car.transportId + "\", " + "\"storageId\":\"" + car.PointTo + "\", " + "\"capacity\":" + car.Capacity + ", \"products\": " + productsJson + "}";
+            car.SendToRabbitMQ(gaveItemsJson, car.channel);
+            string log = String.Format("{0} POST to STORAGE \"{1}\" PRODUCTS:\n{2} \n", car.transportId, car.PointTo, productsStr);
+            Console.WriteLine(log);
+            car.logger.Log(log);
+            car.PointFrom = car.PointTo;
+            log = String.Format("{0} are waiting in {1} for products", car.transportId, car.PointFrom);
+            Thread.Sleep(3000);
+        }
+        #endregion
 
-//            var body = Encoding.UTF8.GetBytes(unloadItemsMessage);
-//            var request = (HttpWebRequest)WebRequest.Create("http://url/changeOwner");
+        #region Communication with ProductService
+        public static void InformAboutUnloadingOfProducts(Car car)
+        {
+            var requestString = @"http://188.225.9.3/products/owner";
 
-//            request.Method = "POST";
-//            request.ContentType = "application/json";
-//            request.ContentLength = body.Length;
+            var productsJson = JsonConvert.SerializeObject(car.Products, _jsonSerializerSettings);
+            string json = "{\"products\": " + productsJson + "}";
+            string StatusCode = "bad";
+            string productsStr = "";
+            while (StatusCode != "OK")
+            {
+                var httpWebRequest = (HttpWebRequest)WebRequest.Create(requestString);
+                httpWebRequest.ContentType = "application/json";
+                httpWebRequest.Method = "PUT";
+                httpWebRequest.Accept = "*/*";
+                var body = Encoding.UTF8.GetBytes(json);
+                using (Stream stream = httpWebRequest.GetRequestStream())
+                {
+                    stream.Write(body, 0, body.Length);
+                    stream.Flush();
+                    stream.Close();
+                }
+                try
+                {
+                    using (var httpResponse = (HttpWebResponse)httpWebRequest.GetResponse())
+                    {
+                        StatusCode = httpResponse.StatusCode.ToString();
+                    }
+                    if (StatusCode == "OK")
+                    {
+                        string giveItemsJson = "{\"action\": \"giveItems\", \"transportId\":\"" + car.transportId + "\", " + "\"storageId\":\"" + car.PointTo + "\", " + "\"capacity\":" + car.Capacity + ", \"products\": " + productsJson + "}";
+                        car.SendToRabbitMQ(giveItemsJson, car.channel);
+                        productsStr = String.Join(", \n", car.Products);
+                        string log = String.Format("{0} PUT to PRODUCTS_SERVICE that PRODUCTS:\n{1} \n are in STORAGE \"{2}\"", car.transportId, productsStr, car.PointTo);
+                        Console.WriteLine(log);
+                        car.logger.Log(log);
+                    }
 
-//            using (Stream stream = request.GetRequestStream())
-//            {
-//                stream.Write(body, 0, body.Length);
-//                stream.Close();
-//            }
+                }
+                catch (Exception e)
+                {
+                    Console.WriteLine(e);
+                    car.logger.Log(e.ToString());
+                }
+            }
 
-//            using (HttpWebResponse response = (HttpWebResponse)request.GetResponse())
-//            {
-//                response.Close();
-//            }
-//        }
-//        public void UnloadItems()
-//        {
+        }
+        public static void InformAboutloadingOfProducts(Car car)
+        {
+            var requestString = @"http://188.225.9.3/products/owner/" + car.transportId;
 
-//        }
-//        public void OnTheRoad()
-//        {
-//            //IConnection connection = factory.CreateConnection();
-//            //IModel channel = connection.CreateModel();
-//            SayProductAboutUnloadingItems();
-//            //channel.QueueDeclare("QUEUE_NAME", false, false, false, null);
-//            //var consumer = new QueueingBasicConsumer(channel);
-//            byte[] message_to_visualizer;
-//            while (RoadPercent<=100)
-//            {
-//                String message = JsonConvert.SerializeObject(this, _jsonSerializerSettings);
-//                //var sendingMessage = Encoding.UTF8.GetBytes(message);
-//                //channel.BasicPublish("", "005", null, sendingMessage);
-//                Console.WriteLine(message);
-//                logger.WriteLogInFile(message);
-//                RoadPercent++;
-//                System.Threading.Thread.Sleep(700);//имитация движения
-//            }
-//            //channel.Close();
-//            //connection.Close();
-//            RoadPercent = 0;
-//            PointTo = "";
-//        }
-//    }
-//}
+            var productsJson = JsonConvert.SerializeObject(car.Products, _jsonSerializerSettings);
+            string productJson = "{\"products\": " + productsJson + "}";
+            string result = "bad";
+            while (result != "OK")
+            {
+                var httpWebRequest = (HttpWebRequest)WebRequest.Create(requestString);
+                httpWebRequest.ContentType = "application/json";
+                httpWebRequest.Method = "PUT";
+                httpWebRequest.Accept = "*/*";
+                var body = Encoding.UTF8.GetBytes(productJson);
+                using (Stream stream = httpWebRequest.GetRequestStream())
+                {
+                    stream.Write(body, 0, body.Length);
+                    stream.Close();
+                }
+                try
+                {
+                    using (var httpResponse = (HttpWebResponse)httpWebRequest.GetResponse())
+                    {
+                        result = httpResponse.StatusCode.ToString();
+                    }
+                    if (result == "OK")
+                    {
+                        string gotItemsJson = "{\"action\": \"gotItems\", \"transportId\":\"" + car.transportId + "\", " + "\"storageId\": \"" + car.PointFrom + "\", " + "\"capacity\":" + car.Capacity + ", \"products\": " + productsJson + "}";
+                        car.SendToRabbitMQ(gotItemsJson, car.channel);
+                        string productsStr = String.Join(", \n", car.Products);
+                        string log = String.Format("{0} PUT to PRODUCTS_SERVICE that PRODUCTS:\n{1} \n are taken from STORAGE \"{2}\"", car.transportId, productsStr, car.PointFrom);
+                        Console.WriteLine(log);
+                        car.logger.Log(log);
+                    }
+                }
+                catch (Exception e)
+                {
+                    Console.WriteLine(e);
+                }
+            }
+        }
+        #endregion
+
+        #region Communication with Visualizer
+        public void SendToRabbitMQ(string message, IModel connection)
+        {
+            try
+            {
+                try
+                {
+                    channel.ExchangeDeclare("Cars", "fanout");
+                    var consumer = new QueueingBasicConsumer(channel);
+                    var body = Encoding.UTF8.GetBytes(message);
+                    channel.BasicPublish(exchange: "Cars",
+                                            routingKey: "",
+                                            basicProperties: null,
+                                            body: body);
+
+                }
+                catch (Exception e)
+                {
+                    Console.WriteLine(e);
+                }
+            }
+            catch (Exception e)
+            {
+                Console.WriteLine(e);
+            }
+
+        }
+        public static void RoadToDestination(Car car)
+        {
+            foreach (var point in car.Products[0].Route)
+            {
+                car.NextPoint = point.Split('|')[0];
+                car.PointFrom = car.NextPoint;
+                car.RoadLength = Int32.Parse(point.Split('|')[1]);
+                if (car.RoadLength == 1)
+                    car.RoadLength = 5;
+                while (car.RoadPercent <= 100)
+                {
+                    String message = JsonConvert.SerializeObject(car, _jsonSerializerSettings);
+                    car.SendToRabbitMQ(message, car.channel);
+                    car.RoadPercent++;
+                    car.logger.Log(message);
+                    Console.WriteLine(message);
+                    Thread.Sleep(car.RoadLength);//имитация движения
+                }
+                car.RoadPercent = 0;
+            }
+        }
+        #endregion
+
+        public static void Work(Car car)
+        {
+            while (true)
+            {
+                GetProductsFromStorage(car);
+                InformAboutloadingOfProducts(car);
+                RoadToDestination(car);
+                InformAboutUnloadingOfProducts(car);
+                PutProductsToStorage(car);
+            }
+        }
+    }
+}
